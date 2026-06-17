@@ -34,6 +34,47 @@ def _get_groq_client():
     return Groq(api_key=api_key)
 
 
+_MODEL = "llama-3.3-70b-versatile"
+
+
+def _chat(prompt: str, temperature: float) -> str:
+    """Send a single user prompt to the LLM and return the text response."""
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase a string and split it into alphanumeric word tokens."""
+    token, tokens = [], []
+    for ch in text.lower():
+        if ch.isalnum():
+            token.append(ch)
+        elif token:
+            tokens.append("".join(token))
+            token = []
+    if token:
+        tokens.append("".join(token))
+    return tokens
+
+
+def _size_matches(requested: str, listing_size: str) -> bool:
+    """
+    Case-insensitive size match. The requested size matches if it equals the
+    listing size or appears as one of its slash/space-separated tokens, so
+    "M" matches "S/M" and "8" matches "US 8".
+    """
+    req = requested.strip().lower()
+    full = listing_size.strip().lower()
+    if req == full:
+        return True
+    return req in set(_tokenize(listing_size))
+
+
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
 
 def search_listings(
@@ -69,8 +110,34 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # 1. Tokenize the query into lowercase words for keyword matching.
+    query_tokens = {tok for tok in _tokenize(description) if tok}
+
+    results: list[tuple[int, dict]] = []
+    for item in listings:
+        # 2a. Price filter (inclusive).
+        if max_price is not None and item["price"] > max_price:
+            continue
+        # 2b. Size filter (case-insensitive; "M" matches "S/M").
+        if size is not None and not _size_matches(size, item["size"]):
+            continue
+
+        # 3. Score by keyword overlap against title, description, style_tags.
+        haystack = " ".join(
+            [item["title"], item["description"], " ".join(item["style_tags"])]
+        )
+        item_tokens = set(_tokenize(haystack))
+        score = len(query_tokens & item_tokens)
+
+        # 4. Drop listings with no relevant match.
+        if score > 0:
+            results.append((score, item))
+
+    # 5. Sort by score (highest first), preserving dataset order for ties.
+    results.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in results]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +167,41 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = (
+        f"{new_item.get('title', 'an item')} "
+        f"(category: {new_item.get('category', 'unknown')}, "
+        f"colors: {', '.join(new_item.get('colors', [])) or 'n/a'}, "
+        f"style: {', '.join(new_item.get('style_tags', [])) or 'n/a'})"
+    )
+
+    items = wardrobe.get("items", [])
+
+    # 1. Empty wardrobe → general styling advice instead of crashing.
+    if not items:
+        prompt = (
+            "You are a thrift-fashion stylist. The user just found this secondhand "
+            f"item: {item_desc}. They have not added anything to their wardrobe yet. "
+            "Suggest 1-2 outfit directions for this piece in general terms — what "
+            "kinds of pieces pair well with it and what vibe it suits. Keep it to a "
+            "short, friendly paragraph."
+        )
+        return _chat(prompt, temperature=0.7)
+
+    # 2. Format the wardrobe so the LLM can reference specific pieces by name.
+    wardrobe_lines = "\n".join(
+        f"- {it.get('name', it.get('id', 'item'))} "
+        f"({it.get('category', '?')}; {', '.join(it.get('colors', []))})"
+        for it in items
+    )
+    prompt = (
+        "You are a thrift-fashion stylist. The user just found this secondhand "
+        f"item: {item_desc}.\n\n"
+        f"Their wardrobe contains:\n{wardrobe_lines}\n\n"
+        "Suggest 1-2 complete outfits that combine the new item with specific "
+        "pieces from their wardrobe. Refer to the wardrobe pieces by name. Add a "
+        "short styling tip (how to wear it). Keep it concise and friendly."
+    )
+    return _chat(prompt, temperature=0.7)
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +233,30 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty or whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "Couldn't generate a fit card: no outfit suggestion was provided. "
+            "Run suggest_outfit first to get a styling idea."
+        )
+
+    title = new_item.get("title", "this thrifted find")
+    price = new_item.get("price")
+    price_str = f"${price:g}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform", "secondhand")
+
+    # 2. Prompt the LLM for a casual, post-ready caption.
+    prompt = (
+        "Write a short, casual Instagram/TikTok OOTD caption (2-4 sentences) for "
+        "a thrifted find. Make it sound like a real person posting, not a product "
+        "listing. Mention the item name, its price, and the platform naturally — "
+        "once each. Capture the outfit's vibe in specific terms.\n\n"
+        f"Item: {title}\n"
+        f"Price: {price_str}\n"
+        f"Platform: {platform}\n"
+        f"Outfit idea: {outfit}\n\n"
+        "Caption:"
+    )
+
+    # 3. Higher temperature so repeated calls produce varied captions.
+    return _chat(prompt, temperature=1.0)
