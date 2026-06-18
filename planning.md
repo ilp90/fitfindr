@@ -76,18 +76,15 @@ If `outfit` is empty or whitespace-only, the tool returns a descriptive error-me
 
 The loop is a fixed sequence with early-exit guards keyed off session state, not free-form tool choice:
 
-1. **Parse the query** into `description`, `size`, `max_price`. Store them in the session.
-2. **Call `search_listings(description, size, max_price)`.** Check the result:
-   - If `results == []` → set `session["error"] = "No listings found…"` (with adjustment suggestions) and **return early**. Do not proceed.
+1. **Parse the query** with regex into `description`, `size`, `max_price` (`_parse_query` in `agent.py`). Store them in `session["parsed"]`.
+2. **Call `search_listings(description, size, max_price)`.** Store in `session["search_results"]` and branch:
+   - If `results == []` → set `session["error"]` to a helpful message (with adjustment suggestions based on which filters were applied) and **return early**. `suggest_outfit` is NOT called.
    - Else → set `session["selected_item"] = results[0]` (top relevance) and continue.
-3. **Check the wardrobe** before styling:
-   - If `wardrobe["items"] == []` → set `session["error"]` telling the user to add wardrobe items, keep `selected_item` so the listing can still be shown, and **return early** (skip steps 4–5).
-   - Else → continue.
-4. **Call `suggest_outfit(selected_item, wardrobe)`** → set `session["outfit_suggestion"]`.
-5. **Validate before the card:** if `outfit_suggestion` is non-empty and `selected_item` has `title`/`price`/`platform` → **call `create_fit_card(outfit_suggestion, selected_item)`** → set `session["fit_card"]`. Otherwise skip and note the card couldn't be generated. (`create_fit_card` also self-guards against an empty outfit, returning an error string.)
-6. **Done condition:** the loop ends when either an `error` was set (early return) or `fit_card` has been produced. Return the session.
+3. **Call `suggest_outfit(selected_item, wardrobe)`** → set `session["outfit_suggestion"]`. The tool itself handles an empty wardrobe by returning general styling advice, so the loop does not need a separate empty-wardrobe branch.
+4. **Call `create_fit_card(outfit_suggestion, selected_item)`** → set `session["fit_card"]`. `create_fit_card` self-guards against an empty outfit string, returning a descriptive error string rather than raising.
+5. **Done condition:** the loop ends when either an `error` was set (no-results early return) or `fit_card` has been produced. Return the session.
 
-Each step's behavior is decided by inspecting session state written by the previous step — the loop never calls a downstream tool with missing/empty input.
+The only conditional branch is on the search result: the loop never calls `suggest_outfit`/`create_fit_card` when the search is empty. Each later step reads the value the previous step wrote into the session.
 
 ---
 
@@ -140,15 +137,11 @@ User query ("vintage graphic tee under $30, I wear baggy jeans + chunky sneakers
 │   │       ▼                                                        │          │
 │   │   session.selected_item = results[0]                           │          │
 │   │       │                                                        │          │
-│   │   wardrobe.items == []                                         │          │
-│   │       ├──► [ERROR] session.error = "wardrobe empty, add…" ─────┤          │
-│   │       │                                                        │          │
 │   ├─► suggest_outfit(selected_item, wardrobe)                      │          │
-│   │       │                                                        │          │
+│   │       │  (empty wardrobe → general advice, no early return)    │          │
 │   │   session.outfit_suggestion = "pair with your baggy jeans…"    │          │
 │   │       │                                                        │          │
-│   │   outfit_suggestion empty OR item missing title/price/platform │          │
-│   │       ├──► [SKIP card] note "couldn't generate caption" ───────┤          │
+│   │   outfit empty → create_fit_card returns an error string       │          │
 │   │       │                                                        │          │
 │   └─► create_fit_card(outfit_suggestion, selected_item)            │          │
 │           │                                                        │          │
